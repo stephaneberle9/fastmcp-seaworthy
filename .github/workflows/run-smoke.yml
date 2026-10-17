@@ -1,0 +1,71 @@
+name: Run unlocked install smoke test
+
+# uv.lock never reaches consumers: a wheel carries only its declared
+# constraints, so every install resolves the newest versions those allow.
+# Locked CI stays green while such an install breaks, e.g. when a dependency
+# ships a release that drops an API this package relies on. This job installs
+# the built wheel the way consumers do, without the lock, and checks that every
+# module still loads.
+
+env:
+  # Enable colored output
+  PY_COLORS: 1
+
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - "src/**"
+      - "uv.lock"
+      - "pyproject.toml"
+      - ".github/workflows/**"
+
+  pull_request:
+
+  # Upstream releases break unlocked installs without any commit here, so a
+  # push trigger alone would only notice at the next unrelated change.
+  schedule:
+    - cron: "0 5 * * *"
+
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  smoke_test:
+    name: "Smoke test unlocked install: Python ${{ matrix.python-version }}"
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10"]
+      fail-fast: false
+    timeout-minutes: 5
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # uv-dynamic-versioning derives the version from git tags
+          fetch-depth: 0
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.1.0
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Build wheel
+        run: uv build --wheel -o dist
+
+      - name: Import every module from an unlocked install
+        run: |
+          uv run --no-project --isolated --with "$(ls dist/*.whl)[dynamodb]" python -c '
+          import importlib, pkgutil
+          from importlib.metadata import version
+          import fastmcp_seaworthy as pkg
+          for m in pkgutil.iter_modules(pkg.__path__, pkg.__name__ + "."):
+              importlib.import_module(m.name)
+          import fastmcp
+          assert callable(getattr(fastmcp.FastMCP, "_lifespan_manager", None)), "fastmcp dropped _lifespan_manager"
+          from key_value.aio.stores.dynamodb import DynamoDBStore
+          print("resolved:", *(f"{d} {version(d)}" for d in ("fastmcp", "py-key-value-aio")))
+          '

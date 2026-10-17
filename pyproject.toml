@@ -1,0 +1,161 @@
+[project]
+name = "fastmcp-seaworthy"
+dynamic = ["version"]
+description = "Production building blocks for FastMCP servers: serve one server under several public hostnames, each a full OAuth identity, and keep the OAuth proxy's state across restarts and secret rotations."
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [
+    { name = "Stephan Eberle", email = "stephaneberle9@gmail.com" }
+]
+requires-python = ">=3.10"
+keywords = ["fastmcp", "mcp", "oauth", "deployment", "dynamodb"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Framework :: AsyncIO",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Topic :: Internet :: WWW/HTTP :: HTTP Servers",
+]
+dependencies = [
+    # The floor: 4.0.8 is the first release carrying all of OAuthProxy's
+    # security fixes (4.0.4 rejects ID-JAG tokens unless identity assertion is
+    # configured, 4.0.6 keeps Google access tokens out of request URLs, 4.0.8
+    # revokes the upstream refresh token instead of sending the proxy's own
+    # token upstream).
+    #
+    # The ceiling guards a private API. serve_http() holds a FastMCP server's
+    # lifespan open through FastMCP._lifespan_manager() and relies on it being
+    # reference-counted, so the per-hostname apps share one lifespan instead of
+    # each running it. No public API offers that for several apps (checked
+    # through 4.1.0), and a private method carries no compatibility promise: a
+    # major that renames it or drops the counting must be unresolvable rather
+    # than break every consumer at startup.
+    "fastmcp>=4.0.8,<5",
+    # FernetEncryptionWrapper and the stores' setup()/close() lifecycle. The
+    # floor matches what fastmcp already enforces (py-key-value-aio>=0.4.4,<0.5),
+    # where DynamoDBStore takes the auto_create switch used to leave table
+    # creation to infrastructure.
+    "py-key-value-aio>=0.4.4",
+    # Transitive-but-imported-directly, declared so a future fastmcp that stops
+    # depending on them fails at resolution rather than at import. The floors
+    # match what the chain already guarantees (fastmcp -> uvicorn>=0.35,
+    # fastmcp -> mcp -> starlette>=0.27, py-key-value-aio's encryption wrapper
+    # -> cryptography>=45), so none of them narrows resolution.
+    "cryptography>=45.0.0",
+    "starlette>=0.27",
+    "uvicorn>=0.35",
+]
+
+[project.urls]
+Homepage = "https://github.com/stephaneberle9/fastmcp-seaworthy"
+Issues = "https://github.com/stephaneberle9/fastmcp-seaworthy/issues"
+
+[project.optional-dependencies]
+# Store backends for the OAuth proxy state (STORE_BACKEND). Each is an extra so
+# the default file store pulls in no cloud SDK; the backend's store class is
+# imported only when it is selected.
+dynamodb = [
+    "py-key-value-aio[dynamodb]>=0.4.4",
+]
+
+[dependency-groups]
+dev = [
+    "ty",
+    "deptry>=0.20",
+    "pre-commit>=4.3.0",
+    "ruff>=0.17,<0.18",  # keep in sync with the ruff-pre-commit rev in .pre-commit-config.yaml
+]
+test = [
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.21.0",
+    "pytest-cov>=4.0.0",
+    "packaging>=22",
+    # Imported by the tests only; all of them arrive with fastmcp anyway.
+    "httpx2>=2.5.0",
+    "mcp>=2.0.0",
+    "pydantic>=2.12.0",
+    # The DynamoDB store backend is tested against moto's server mode, bound to
+    # 127.0.0.1 in-process, so the suite needs neither AWS nor Docker. Server
+    # mode rather than moto's in-process patching: the store talks through
+    # aioboto3, whose aiohttp transport the botocore patches do not intercept.
+    # Server mode needs flask and flask-cors, which moto declares only under
+    # its "server" extra; that extra also drags in every other service's
+    # dependencies, so the two are named here instead. The backend extra itself
+    # is pulled in through the project so CI, which installs no extras, still
+    # exercises the backend.
+    "fastmcp-seaworthy[dynamodb]",
+    "boto3>=1.35",
+    "moto[dynamodb]>=5.1.0",
+    "flask>=3.0",
+    "flask-cors>=4.0",
+]
+
+[build-system]
+requires = ["hatchling", "uv-dynamic-versioning"]
+build-backend = "hatchling.build"
+
+[tool.uv-dynamic-versioning]
+enable = true
+vcs = "git"
+style = "pep440"
+
+[tool.hatch.version]
+source = "uv-dynamic-versioning"
+
+[tool.hatch.build.targets.wheel]
+sources = ["src"]
+exclude = ["*.log"]
+
+[tool.hatch.build.targets.sdist]
+sources = ["src"]
+exclude = ["*.log"]
+
+[tool.uv]
+default-groups = ["dev", "test"]
+
+[tool.deptry]
+# Regexes, not globs: "*.log" is an invalid regex and makes deptry panic.
+exclude = ['.*\.log', '.*\.venv', 'tests']
+
+[tool.deptry.package_module_name_map]
+# py-key-value-aio installs as `key_value`, which deptry cannot infer from the
+# distribution name.
+py-key-value-aio = ["key_value"]
+
+[tool.ruff.lint]
+extend-select = ["I", "UP"]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401", "I001", "RUF013"]
+
+[tool.codespell]
+skip = "*.lock,pyproject.toml,*PythonImportHelper*"
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = [
+    "-ra",
+    "--strict-markers",
+    "--strict-config",
+    "--cov=fastmcp_seaworthy",
+    "--cov-report=term-missing",
+    "--cov-report=html",
+]
+asyncio_mode = "auto"
+
+[tool.coverage.run]
+source = ["src"]
+omit = ["tests/*", "**/__pycache__/*"]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise AssertionError",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+    "if TYPE_CHECKING:",
+]
