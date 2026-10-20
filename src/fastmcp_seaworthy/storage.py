@@ -33,9 +33,10 @@ To add a new store backend:
 
 from __future__ import annotations
 
+import logging
 import os
 import warnings
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal, cast, get_args
 
@@ -44,7 +45,19 @@ from fastmcp.server.auth.jwt_issuer import derive_jwt_key
 from key_value.aio.errors import StoreSetupError
 from key_value.aio.protocols.key_value import AsyncKeyValue
 from key_value.aio.stores.base import BaseContextManagerStore
+from key_value.aio.wrappers.base import BaseWrapper
 from key_value.aio.wrappers.encryption import FernetEncryptionWrapper
+
+logger = logging.getLogger(__name__)
+
+MIN_JWT_SIGNING_KEY_LENGTH = 32
+"""The shortest ``JWT_SIGNING_KEY`` accepted, in characters.
+
+Whoever guesses the key can mint access tokens, and FastMCP stretches it under a
+salt that is the same in every deployment, so a short key is guessable offline
+against a table computed once for all of them. 32 characters of
+``secrets.token_urlsafe(32)`` carry 192 bits.
+"""
 
 StoreBackend = Literal["file", "dynamodb"]
 """Where the OAuth proxy keeps its state.
@@ -102,8 +115,9 @@ class OAuthStateSettings:
             rollout instead.
 
     Raises:
-        ValueError: From construction, for a store the server could not keep
-            readable -- an unknown backend, an external backend without a
+        ValueError: From construction, for a signing key shorter than
+            :data:`MIN_JWT_SIGNING_KEY_LENGTH`, or a store the server could not
+            keep readable -- an unknown backend, an external backend without a
             signing key, or DynamoDB without a table.
     """
 
@@ -114,6 +128,16 @@ class OAuthStateSettings:
     store_dynamodb_auto_create: bool = False
 
     def __post_init__(self) -> None:
+        if (
+            self.jwt_signing_key
+            and len(self.jwt_signing_key) < MIN_JWT_SIGNING_KEY_LENGTH
+        ):
+            # The length only, never the key: this message reaches the log.
+            raise ValueError(
+                f"JWT_SIGNING_KEY must be at least {MIN_JWT_SIGNING_KEY_LENGTH} "
+                f"characters -- got {len(self.jwt_signing_key)}. Generate one "
+                'with: python -c "import secrets; print(secrets.token_urlsafe(32))"'
+            )
         # The signing key is mandatory with any external backend because
         # without it FastMCP derives the store's encryption key from the
         # upstream client secret: the first rotation of that secret would
@@ -172,6 +196,27 @@ class OAuthStateSettings:
                 env, "STORE_DYNAMODB_AUTO_CREATE", default=False
             ),
         )
+
+    def describe(self) -> str:
+        """Name the store and the signing key in effect, for the startup log.
+
+        Every combination these settings accept starts a healthy-looking server,
+        including the ones that keep the restart-fragile defaults: a signing key
+        with no ``STORE_BACKEND`` stays on the file store, and an empty
+        ``JWT_SIGNING_KEY`` goes back to deriving the key from the upstream
+        client secret. One line at startup makes what is actually in use
+        visible. Names settings only, never the key.
+        """
+        if self.store_backend == "dynamodb":
+            store = f"DynamoDB table {self.store_dynamodb_table!r}"
+        else:
+            store = "FastMCP's file store under FASTMCP_HOME"
+        key = (
+            "JWT_SIGNING_KEY"
+            if self.jwt_signing_key
+            else "a key derived from the upstream client secret"
+        )
+        return f"OAuth state in {store}, tokens signed with {key}"
 
     def provider_kwargs(self, client_storage: ClientStorage | None) -> dict[str, Any]:
         """Keyword arguments carrying the signing key and store to an ``OAuthProxy``.
@@ -232,6 +277,74 @@ class ClientStorage:
 
     async def close(self) -> None:
         await self.backend.close()
+
+
+_ENCRYPTED_DATA_KEY = "__encrypted_data__"
+"""The field FernetEncryptionWrapper stores its ciphertext under."""
+
+
+class _RefuseUnencryptedWrapper(BaseWrapper):
+    """Reads an entry that is not encrypted as missing.
+
+    Sits between ``FernetEncryptionWrapper`` and the backend. That wrapper
+    returns an entry without its ciphertext field as-is, before decrypting
+    anything, so Fernet's authentication never runs on it: whoever can write
+    to the backend -- with no key -- could plant a plaintext client
+    registration with their own redirect URI, and the proxy would validate
+    ``/authorize`` against it. Everything this library writes is encrypted, so
+    an unencrypted entry is either tampering or debris; either way it reads as
+    missing, the same as an entry written under another key.
+    """
+
+    def __init__(self, key_value: AsyncKeyValue) -> None:
+        self.key_value: AsyncKeyValue = key_value
+        super().__init__()
+
+    @staticmethod
+    def _refuse_unencrypted(
+        value: dict[str, Any] | None, key: str, collection: str | None
+    ) -> dict[str, Any] | None:
+        if value is None or _ENCRYPTED_DATA_KEY in value:
+            return value
+        logger.warning(
+            "Ignoring unencrypted entry %r in collection %r: everything this "
+            "server writes is encrypted, so it was written by someone else",
+            key,
+            collection,
+        )
+        return None
+
+    async def get(
+        self, key: str, *, collection: str | None = None
+    ) -> dict[str, Any] | None:
+        value = await self.key_value.get(key=key, collection=collection)
+        return self._refuse_unencrypted(value, key, collection)
+
+    async def get_many(
+        self, keys: Sequence[str], *, collection: str | None = None
+    ) -> list[dict[str, Any] | None]:
+        values = await self.key_value.get_many(keys=keys, collection=collection)
+        return [
+            self._refuse_unencrypted(value, key, collection)
+            for key, value in zip(keys, values)
+        ]
+
+    async def ttl(
+        self, key: str, *, collection: str | None = None
+    ) -> tuple[dict[str, Any] | None, float | None]:
+        value, ttl = await self.key_value.ttl(key=key, collection=collection)
+        value = self._refuse_unencrypted(value, key, collection)
+        return value, ttl if value is not None else None
+
+    async def ttl_many(
+        self, keys: Sequence[str], *, collection: str | None = None
+    ) -> list[tuple[dict[str, Any] | None, float | None]]:
+        results = await self.key_value.ttl_many(keys=keys, collection=collection)
+        refused = []
+        for key, (value, ttl) in zip(keys, results):
+            value = self._refuse_unencrypted(value, key, collection)
+            refused.append((value, ttl if value is not None else None))
+        return refused
 
 
 def _dynamodb_backend(
@@ -322,9 +435,11 @@ def build_client_storage(settings: OAuthStateSettings) -> ClientStorage | None:
     # default is. raise_on_decryption_error=False matches FastMCP too: an entry
     # written under another key reads as missing -- the client re-registers or
     # the user signs in again -- instead of failing every request that touches
-    # it.
+    # it. Below it, _RefuseUnencryptedWrapper makes "reads as missing" also hold
+    # for an entry that is not encrypted at all, which the wrapper would
+    # otherwise return unauthenticated.
     store = FernetEncryptionWrapper(
-        key_value=backend,
+        key_value=_RefuseUnencryptedWrapper(backend),
         fernet=Fernet(key=storage_encryption_key(settings.jwt_signing_key)),
         raise_on_decryption_error=False,
     )

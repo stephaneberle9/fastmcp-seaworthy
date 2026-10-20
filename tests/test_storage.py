@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import subprocess
 import sys
@@ -11,7 +12,11 @@ from unittest.mock import patch
 import pytest
 from key_value.aio.wrappers.encryption import FernetEncryptionWrapper
 
-from fastmcp_seaworthy.storage import OAuthStateSettings, build_client_storage
+from fastmcp_seaworthy.storage import (
+    MIN_JWT_SIGNING_KEY_LENGTH,
+    OAuthStateSettings,
+    build_client_storage,
+)
 
 from .conftest import dynamodb_client
 
@@ -47,6 +52,23 @@ class TestValidation:
     def test_dynamodb_without_table_is_refused_naming_the_setting(self):
         with pytest.raises(ValueError, match="requires STORE_DYNAMODB_TABLE"):
             OAuthStateSettings(jwt_signing_key=SIGNING_KEY, store_backend="dynamodb")
+
+    def test_short_signing_key_is_refused_naming_its_length_not_the_key(self):
+        """Whoever guesses the key mints access tokens, and its stretching salt
+        is the same in every deployment."""
+        short = "x" * (MIN_JWT_SIGNING_KEY_LENGTH - 1)
+        with pytest.raises(ValueError, match="at least 32 characters") as excinfo:
+            OAuthStateSettings(jwt_signing_key=short)
+        assert f"got {len(short)}" in str(excinfo.value)
+        assert short not in str(excinfo.value)
+
+    def test_short_signing_key_is_refused_with_the_file_store_too(self):
+        """The key signs the tokens whatever the store."""
+        with pytest.raises(ValueError, match="JWT_SIGNING_KEY must be at least"):
+            OAuthStateSettings.from_env({"JWT_SIGNING_KEY": "x"})
+
+    def test_signing_key_of_the_minimum_length_is_accepted(self):
+        OAuthStateSettings(jwt_signing_key="x" * MIN_JWT_SIGNING_KEY_LENGTH)
 
     def test_unknown_backend_is_refused(self):
         """A typo must not quietly fall back to the restart-fragile file store."""
@@ -101,6 +123,28 @@ class TestFromEnv:
     def test_unknown_backend_is_refused(self):
         with pytest.raises(ValueError, match="got 'dynamo'"):
             OAuthStateSettings.from_env({"STORE_BACKEND": "dynamo"})
+
+
+class TestDescribe:
+    """Every accepted combination starts a healthy-looking server, so the
+    startup line is what tells a half-configured deployment apart."""
+
+    def test_dynamodb_names_the_table_and_the_key_setting(self):
+        assert _dynamodb_settings("oauth-state").describe() == (
+            "OAuth state in DynamoDB table 'oauth-state', "
+            "tokens signed with JWT_SIGNING_KEY"
+        )
+
+    def test_a_signing_key_without_a_backend_shows_the_file_store(self):
+        description = OAuthStateSettings.from_env(
+            {"JWT_SIGNING_KEY": SIGNING_KEY}
+        ).describe()
+        assert "FastMCP's file store" in description
+        assert SIGNING_KEY not in description
+
+    def test_an_empty_signing_key_shows_the_derived_key(self):
+        description = OAuthStateSettings.from_env({"JWT_SIGNING_KEY": ""}).describe()
+        assert description.endswith("a key derived from the upstream client secret")
 
 
 class TestProviderKwargs:
@@ -218,6 +262,74 @@ class TestDynamoDBStorage:
         raw = items[0]["value"]["S"]
         assert "plaintext-upstream-access-token" not in raw
         assert "access_token" not in raw
+
+    async def test_unencrypted_entries_read_as_missing(
+        self, dynamodb_table: str, aws_env, caplog: pytest.LogCaptureFixture
+    ):
+        """Write access to the table without the key must not be enough to plant
+        state: FernetEncryptionWrapper returns an entry lacking its ciphertext
+        field unauthenticated, so a plaintext client registration with a
+        foreign redirect URI would otherwise be served as genuine."""
+        storage = build_client_storage(_dynamodb_settings(dynamodb_table))
+        assert storage is not None
+        collection = "mcp-oauth-proxy-clients"
+        forged = {
+            "client_id": "legit-client",
+            "redirect_uris": ["https://evil.example/"],
+        }
+        await storage.open()
+        try:
+            await storage.store.put(
+                key="legit-client",
+                value={"client_id": "legit-client"},
+                collection=collection,
+            )
+            # The backend itself, unencrypted: what a writer without the key can do.
+            await storage.backend.put(
+                key="legit-client", value=forged, collection=collection
+            )
+            await storage.backend.put(
+                key="planted", value=forged, collection=collection
+            )
+
+            with caplog.at_level(logging.WARNING, logger="fastmcp_seaworthy.storage"):
+                assert (
+                    await storage.store.get(key="legit-client", collection=collection)
+                    is None
+                )
+                assert await storage.store.get_many(
+                    ["legit-client", "planted"], collection=collection
+                ) == [None, None]
+                assert await storage.store.ttl(
+                    key="planted", collection=collection
+                ) == (
+                    None,
+                    None,
+                )
+                assert await storage.store.ttl_many(
+                    ["planted"], collection=collection
+                ) == [(None, None)]
+        finally:
+            await storage.close()
+
+        assert "Ignoring unencrypted entry 'planted'" in caplog.text
+
+    async def test_encrypted_entries_keep_their_ttl(self, dynamodb_table: str, aws_env):
+        storage = build_client_storage(_dynamodb_settings(dynamodb_table))
+        assert storage is not None
+        await storage.open()
+        try:
+            await storage.store.put(key="k", value={"v": 1}, collection="c", ttl=300)
+            value, ttl = await storage.store.ttl(key="k", collection="c")
+            [(many_value, many_ttl)] = await storage.store.ttl_many(
+                ["k"], collection="c"
+            )
+        finally:
+            await storage.close()
+
+        assert value == many_value == {"v": 1}
+        assert ttl is not None and 0 < ttl <= 300
+        assert many_ttl is not None and 0 < many_ttl <= 300
 
     async def test_missing_table_fails_at_startup_naming_it(self, aws_env):
         """Infrastructure creates the table; with auto_create off a missing one

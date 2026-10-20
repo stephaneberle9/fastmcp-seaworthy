@@ -11,6 +11,7 @@
 from .host_router import HostRouter, check_distinct_hosts, host_of, split_base_urls
 from .serve import AuthFactory, build_host_router, serve_http
 from .storage import (
+    MIN_JWT_SIGNING_KEY_LENGTH,
     ClientStorage,
     OAuthStateSettings,
     StoreBackend,
@@ -19,6 +20,7 @@ from .storage import (
 )
 
 __all__ = [
+    "MIN_JWT_SIGNING_KEY_LENGTH",
     "AuthFactory",
     "ClientStorage",
     "HostRouter",

@@ -187,7 +187,7 @@ Read by `OAuthStateSettings.from_env()`. Empty values count as unset.
 
 | Variable | Description |
 | --- | --- |
-| `JWT_SIGNING_KEY` | Secret the server signs its tokens with and derives the store's encryption key from. Keep it in a secret store and stable across deployments. Unset, FastMCP derives both from the upstream client secret. Required with any `STORE_BACKEND` other than `file`. |
+| `JWT_SIGNING_KEY` | Secret the server signs its tokens with and derives the store's encryption key from. At least 32 characters, e.g. from `secrets.token_urlsafe(32)`; a shorter one is an error. Keep it in a secret store and stable across deployments. Unset, FastMCP derives both from the upstream client secret. Required with any `STORE_BACKEND` other than `file`. |
 | `STORE_BACKEND` | `file` (default) for FastMCP's own encrypted file store, or `dynamodb`. An unknown value is an error, not a fallback to `file`. |
 | `STORE_DYNAMODB_TABLE` | DynamoDB table name. Required for `STORE_BACKEND=dynamodb`. |
 | `STORE_DYNAMODB_REGION` | AWS region of the table. Optional; unset, the AWS SDK's usual chain decides. |
@@ -197,7 +197,16 @@ The values written to an external store are Fernet-encrypted with a key derived
 from `JWT_SIGNING_KEY` exactly as FastMCP derives its file store's key, so the
 store never holds an upstream token in plaintext. An entry written under a
 different key reads as missing: clients re-register and users sign in again,
-instead of every request failing.
+instead of every request failing. So does an entry that is not encrypted at
+all: everything the server writes is, so such an entry was written by someone
+with write access to the store but not the key, and is logged as a warning.
+
+Only the values are encrypted. Each entry's collection, key and expiry are
+stored as they are: client IDs, token IDs and, while they are valid,
+authorization codes. None of them can be redeemed without the encrypted value
+(an authorization code also needs the client's PKCE verifier), but they show
+who signs in when. Treat the table's backups and exports accordingly, and
+scope write access to the table to the server alone.
 
 `JWT_SIGNING_KEY` is worth setting with the default file store too: it
 decouples the stored state from the upstream client secret.
@@ -252,12 +261,14 @@ if the server lifespan must outlive the router, as `serve_http` does.
 
 `OAuthStateSettings(jwt_signing_key=None, store_backend="file", store_dynamodb_table=None, store_dynamodb_region=None, store_dynamodb_auto_create=False)`
 — the signing key and the store an `OAuthProxy` keeps its state in. Frozen
-dataclass; construction raises `ValueError` for a combination the server could
-not keep readable.
+dataclass; construction raises `ValueError` for a signing key shorter than
+`MIN_JWT_SIGNING_KEY_LENGTH` (32) or a combination the server could not keep
+readable.
 
 | Method | Description |
 | --- | --- |
 | `from_env(environ=None)` | Class method; reads the [environment variables](#environment-variables) from `environ`, default `os.environ` |
+| `describe()` | Returns one line naming the store and signing key in effect, for the startup log; never the key itself |
 | `provider_kwargs(client_storage)` | Returns the `jwt_signing_key` and `client_storage` keyword arguments for an `OAuthProxy` subclass, each only when set; not for a `RemoteAuthProvider` such as `KeycloakAuthProvider` |
 
 ### `build_client_storage`
