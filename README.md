@@ -208,6 +208,12 @@ authorization codes. None of them can be redeemed without the encrypted value
 who signs in when. Treat the table's backups and exports accordingly, and
 scope write access to the table to the server alone.
 
+The check for unencrypted entries covers the external stores this library
+builds. With `STORE_BACKEND=file`, FastMCP builds its own store, which still
+trusts an unencrypted file. That is harmless while only the server's own
+process can write to its directory, but on a volume shared with anything
+else, whoever can write files there can plant state.
+
 `JWT_SIGNING_KEY` is worth setting with the default file store too: it
 decouples the stored state from the upstream client secret.
 
