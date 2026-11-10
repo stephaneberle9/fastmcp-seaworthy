@@ -1,9 +1,9 @@
 # fastmcp-seaworthy <!-- omit in toc -->
 
 Production building blocks for [FastMCP](https://gofastmcp.com) servers: serve
-one server under several public hostnames, each a full OAuth identity, and keep
+one server under several public hostnames, each a full OAuth identity, keep
 the OAuth proxy's state across restarts and rotations of the upstream client
-secret.
+secret, and limit which MCP clients may connect.
 
 A FastMCP server that runs fine on a laptop can still fail in production: it
 answers OAuth discovery under one hostname only, and with an `OAuthProxy`-based
@@ -21,7 +21,8 @@ server that uses it.
 - [Usage](#usage)
   - [Serving several hostnames](#serving-several-hostnames)
   - [Surviving restarts](#surviving-restarts)
-  - [Both together](#both-together)
+  - [Limiting which clients connect](#limiting-which-clients-connect)
+  - [All together](#all-together)
 - [Configuration](#configuration)
   - [Environment variables](#environment-variables)
   - [DynamoDB table](#dynamodb-table)
@@ -31,6 +32,7 @@ server that uses it.
   - [`OAuthStateSettings`](#oauthstatesettings)
   - [`build_client_storage`](#build_client_storage)
   - [`ClientStorage`](#clientstorage)
+  - [`ClientAllowlist`](#clientallowlist)
   - [`HostRouter`](#hostrouter)
   - [Helpers](#helpers)
 - [Contributing](#contributing)
@@ -48,6 +50,8 @@ Typical use cases:
 - Rotating the upstream IdP's client secret without invalidating every issued
   token and every client registration.
 - Running several replicas of one MCP server that share their OAuth state.
+- Accepting only MCP clients whose vendors the operator has vetted, because
+  the client sends the tool results to its vendor's LLM.
 
 ## Installation
 
@@ -149,21 +153,171 @@ Open the store before serving, so a missing table or missing permissions fail
 the rollout rather than the first sign-in, and close it afterwards —
 `serve_http` does both when given the store.
 
-### Both together
+### Limiting which clients connect
 
-Build the store once and share it between the hostnames: they are separate
-OAuth identities of one deployment, not separate deployments.
+Registration tells an OAuth server which client software is asking, never
+which user. Where tool results may only reach service providers the operator
+has vetted — under professional-secrecy rules or data-processing agreements,
+say — the vendor of the MCP client is one of them, since the client sends the
+tool results to its LLM. Behind an `OAuthProxy` the upstream IdP cannot make
+that call: every token it issues names the proxy's own upstream application,
+never the MCP client. The proxy is the authorization server the client talks
+to, so the check belongs there.
+
+A client identifies itself to the proxy in one of three ways:
+
+1. **With a Client ID Metadata Document (CIMD).** The `client_id` is an HTTPS
+   URL under a domain its publisher controls — Claude's is
+   `https://claude.ai/oauth/mcp-oauth-client-metadata` — and the document at
+   that URL lists the client's redirect URIs.
+2. **With Dynamic Client Registration (DCR).** The client registers at
+   `/register` and gets a random `client_id`.
+3. **With the `client_id` of the upstream application's static client**,
+   entered by hand: the "own OAuth client" option of Claude's custom connector
+   dialog, or Claude Code's `--client-id`. FastMCP accepts it without
+   registration. The rest of this section calls it the upstream `client_id`.
+
+#### Client allowlist
+
+The client allowlist is the mechanism that decides which clients get in. It
+checks the `client_id` a client presents, whichever of the three ways it got
+it, and refuses every `client_id` not on the list. How that plays out for each
+way is described in the three subsections that follow.
+
+`ClientAllowlist` reads the allowed clients from `ALLOWED_CLIENT_IDS`, and
+`apply` enforces them on any `OAuthProxy` subclass:
 
 ```python
+from fastmcp_seaworthy import ClientAllowlist
+
+allowlist = ClientAllowlist.from_env()  # e.g. ALLOWED_CLIENT_IDS=https://claude.ai/
+
+provider = allowlist.apply(AWSCognitoProvider(...))
+```
+
+Unset, `apply` returns the provider untouched, so the call can stay in place
+in every deployment. Each entry matches a `client_id` in one of two ways:
+
+- **Exactly**, for any entry: a CIMD URL, or the upstream `client_id`.
+- **As a prefix**, for an `https://` URL ending in `/`: `https://claude.ai/`
+  allows every client published under that host, `https://example.com/clients/`
+  every client under that path. The trailing `/` is what keeps
+  `https://claude.ai/` from matching `https://claude.ai.attacker.example/`,
+  which is why there are no wildcards. A `client_id` with a `.` or `..` path
+  segment never matches a prefix.
+
+Matching is case-sensitive, on the `client_id` as the client sends it.
+Malformed entries — a `*`, an `http://` URL, an `https://` URL without a path
+or with a query, fragment, credentials or dot segment — fail at startup.
+
+A `client_id` that matches no entry is refused with an OAuth error and a
+warning in the log, before anything else happens. The token endpoint looks
+clients up the same way, so removing an entry stops that client from
+refreshing its tokens, not only from signing in again. Access tokens already
+issued stay valid until they expire.
+
+`allowlist.describe()` returns one line naming the clients accepted, for the
+startup log.
+
+#### CIMD clients
+
+This applies to way 1. A CIMD `client_id` is a URL attributable to its
+publisher, so it can be allowed by publisher with a prefix entry, and it is
+the way the allowlist is designed around. A CIMD URL not on the list is never fetched,
+which also removes the proxy's outbound requests for everything not on the
+list.
+
+A CIMD client may only redirect to the `redirect_uris` its own document lists,
+which FastMCP enforces. That is what makes the `client_id` worth trusting:
+Claude's document lists only `https://claude.ai/api/mcp/auth_callback`, so an
+authorization code issued to that `client_id` can only reach Claude. Claude
+Code publishes its own document,
+`https://claude.ai/oauth/claude-code-client-metadata`, which lists the
+loopback callbacks `http://localhost/callback` and `http://127.0.0.1/callback`,
+on any port. `ALLOWED_CLIENT_IDS=https://claude.ai/` therefore admits both.
+A loopback callback stays on the user's own machine, so any program running
+there can present Claude Code's `client_id`: allowing a loopback client keeps
+out other vendors' hosted clients, not software the user runs locally.
+
+#### DCR clients
+
+This applies to way 2. A `client_id` from DCR is random and anonymous, so
+there is nothing to list, and the allowlist turns DCR off: the `/register`
+route and the `registration_endpoint` in the authorization-server metadata
+disappear, so a client does not attempt a registration that could only fail,
+and nobody can write registrations into the store. Clients registered through
+DCR before the allowlist was set are refused. Clients that support CIMD switch
+to it, since the metadata advertises `client_id_metadata_document_supported`.
+Where clients that support only or also DCR must keep registering through
+DCR, leave `ALLOWED_CLIENT_IDS` unset: the allowlist and DCR cannot be used
+together.
+
+#### The upstream `client_id`
+
+This applies to way 3 only; `ALLOWED_UPSTREAM_CLIENT_REDIRECT_URIS` has no
+effect on CIMD or DCR clients.
+
+For the upstream `client_id`, FastMCP builds a client on the fly. That client
+has no document and accepts any redirect URI, so on its own the `client_id`
+would let in whoever knows it, and the authorization code would go wherever
+they asked. Listing the upstream `client_id` therefore requires
+`ALLOWED_UPSTREAM_CLIENT_REDIRECT_URIS`, the redirect URIs the clients sending
+it may use, in the pattern syntax of FastMCP's `allowed_client_redirect_uris`.
+For Claude's connector dialog, that is Claude's callback; for Claude Code, the
+loopback addresses:
+
+```bash
+ALLOWED_CLIENT_IDS="https://claude.ai/ my-upstream-client-id"
+ALLOWED_UPSTREAM_CLIENT_REDIRECT_URIS="https://claude.ai/api/mcp/auth_callback http://localhost:* http://127.0.0.1:*"
+```
+
+`apply` refuses to start without it. Unlike `allowed_client_redirect_uris`,
+which FastMCP applies to every client, this list applies to the upstream
+`client_id` only, so CIMD clients keep the redirect URIs their documents list.
+When the provider also sets `allowed_client_redirect_uris`, a redirect URI has
+to pass both.
+
+The client FastMCP builds for the upstream `client_id` is a public client: it
+has no secret and authenticates with PKCE alone. Way 3 therefore works only
+with clients that send just a `client_id` and use PKCE, never with
+confidential clients that also send a `client_secret`. Leave the secret field
+empty, and never hand the upstream application's secret to a client. This
+limit comes from FastMCP, not from `fastmcp-seaworthy`, which neither adds nor
+removes it.
+
+### All together
+
+Build the store and the allowlist once and use them for every hostname: the
+hostnames are separate OAuth identities of one deployment, not separate
+deployments. Applying the allowlist in `auth_for` makes every hostname's
+provider enforce it.
+
+```python
+import logging
+
+from fastmcp_seaworthy import (
+    ClientAllowlist,
+    OAuthStateSettings,
+    build_client_storage,
+    serve_http,
+    split_base_urls,
+)
+
+
 async def main() -> None:
     settings = OAuthStateSettings.from_env()
     storage = build_client_storage(settings)
+    allowlist = ClientAllowlist.from_env()
+    logging.info(settings.describe())
+    logging.info(allowlist.describe())
 
     def auth_for(base_url: str) -> AWSCognitoProvider:
-        return AWSCognitoProvider(
-            ...,
-            base_url=base_url,
-            **settings.provider_kwargs(storage),
+        return allowlist.apply(
+            AWSCognitoProvider(
+                ...,
+                base_url=base_url,
+                **settings.provider_kwargs(storage),
+            )
         )
 
     await serve_http(
@@ -183,7 +337,8 @@ asyncio.run(main())
 
 ### Environment variables
 
-Read by `OAuthStateSettings.from_env()`. Empty values count as unset.
+Read by `OAuthStateSettings.from_env()`, except `ALLOWED_CLIENT_IDS`, which
+`ClientAllowlist.from_env()` reads. Empty values count as unset.
 
 | Variable | Description |
 | --- | --- |
@@ -192,6 +347,8 @@ Read by `OAuthStateSettings.from_env()`. Empty values count as unset.
 | `STORE_DYNAMODB_TABLE` | DynamoDB table name. Required for `STORE_BACKEND=dynamodb`. |
 | `STORE_DYNAMODB_REGION` | AWS region of the table. Optional; unset, the AWS SDK's usual chain decides. |
 | `STORE_DYNAMODB_AUTO_CREATE` | `true` to create a missing table at startup. Default `false`, so a missing table fails the rollout and the server needs no `dynamodb:CreateTable`. |
+| `ALLOWED_CLIENT_IDS` | The OAuth clients the server accepts, separated by commas or whitespace: exact `client_id`s, or `https://` URLs ending in `/` that allow every `client_id` under them (see [Limiting which clients connect](#limiting-which-clients-connect)). Unset, every client is accepted and DCR stays open. Set, DCR is off. |
+| `ALLOWED_UPSTREAM_CLIENT_REDIRECT_URIS` | The redirect URIs a client sending the `client_id` of the upstream application's static client may use, separated by commas or whitespace, in the pattern syntax of FastMCP's `allowed_client_redirect_uris` (e.g. `http://localhost:*`). Required when `ALLOWED_CLIENT_IDS` allows the upstream `client_id`, and applied to that client only (see [The upstream `client_id`](#the-upstream-client_id)). |
 
 The values written to an external store are Fernet-encrypted with a key derived
 from `JWT_SIGNING_KEY` exactly as FastMCP derives its file store's key, so the
@@ -295,6 +452,22 @@ Returned by `build_client_storage`.
 | `description` | `str` | Names the backend's location in startup errors |
 | `await open()` | `None` | Connects; raises `ValueError` naming the backend when it cannot be used |
 | `await close()` | `None` | Closes the backend |
+
+### `ClientAllowlist`
+
+`ClientAllowlist(client_ids=(), upstream_client_redirect_uris=())` — the OAuth
+clients an `OAuthProxy` accepts, or every client when empty, and the redirect
+URIs allowed for the upstream `client_id`. Frozen dataclass; construction
+raises `ValueError`, naming the entry's position but not the entry, for a
+malformed entry, and for redirect URIs without any client ID.
+
+| Member | Description |
+| --- | --- |
+| `from_env(environ=None)` | Class method; reads `ALLOWED_CLIENT_IDS` and `ALLOWED_UPSTREAM_CLIENT_REDIRECT_URIS` from `environ`, default `os.environ` |
+| `enabled` | Property; whether any entry is set |
+| `allows(client_id)` | Returns whether `client_id` matches an entry; always `True` when empty |
+| `describe()` | Returns one line naming the clients accepted, for the startup log |
+| `apply(provider)` | Returns `provider` with the allowlist enforced and DCR turned off; untouched when empty. Call it before the provider's routes are built. Raises `TypeError` for a provider that is not an `OAuthProxy` and `ValueError` when an allowlist is already applied or the upstream `client_id` is allowed without `upstream_client_redirect_uris` |
 
 ### `HostRouter`
 
