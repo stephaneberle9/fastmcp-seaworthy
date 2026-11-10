@@ -43,3 +43,21 @@ at least two independent servers need it and it touches no server's own domain.
 Code that depends on FastMCP internals (`_lifespan_manager`, `OAuthProxy`'s key
 derivation) is the strongest candidate, because this is the one place a FastMCP
 release that changes them gets fixed and tested.
+
+## Upstream contribution candidates
+
+Workarounds here that belong in FastMCP itself. When a FastMCP release ships
+one, remove the workaround and its entry, and keep the tests that guard the
+behavior.
+
+- **Client allowlist on `OAuthProxy`.** `ClientAllowlist.apply`
+  (`clients.py`) patches `get_client` and `register_client` on the provider
+  instance, because FastMCP has no parameter for it. Proposal: an
+  `allowed_client_ids` parameter on `OAuthProxy` with the same matching rule
+  (exact, or an `https://` prefix ending in `/`), which refuses an unlisted
+  `client_id` before any CIMD fetch and turns DCR off, plus a redirect URI
+  limit scoped to the client FastMCP builds for the upstream static
+  `client_id`, which otherwise accepts any redirect URI
+  (`test_without_the_allowlist_fastmcp_accepts_any_redirect_uri` notices when
+  that changes). Not proposed yet; no FastMCP issue or PR covered it as of
+  2026-11-10.
