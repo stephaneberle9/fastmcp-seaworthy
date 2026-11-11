@@ -201,6 +201,17 @@ class TestBuildClientStorage:
             build_client_storage(_dynamodb_settings())
 
 
+def test_every_external_backend_has_a_factory():
+    """The literal and the registry name the same backends: a literal without a
+    factory would pass validation and fail with a KeyError in build."""
+    from typing import get_args
+
+    from fastmcp_seaworthy.storage import StoreBackend
+    from fastmcp_seaworthy.storage._settings import STORE_FACTORIES
+
+    assert set(STORE_FACTORIES) == set(get_args(StoreBackend)) - {"file"}
+
+
 def test_nothing_configured_imports_no_backend_dependency():
     """Acceptance: a deployment that selects no backend loads no cloud SDK.
 
