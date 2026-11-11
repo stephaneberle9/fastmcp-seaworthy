@@ -195,8 +195,16 @@ A client identifies itself to the proxy in one of three ways:
 
 The client allowlist is the mechanism that decides which clients get in. It
 checks the `client_id` a client presents, whichever of the three ways it got
-it, and refuses every `client_id` not on the list. How that plays out for each
-way is described in the three subsections that follow.
+it, and refuses every `client_id` not on the list. Which settings limit the
+clients of each way:
+
+| Way | Client | Settings that limit it | Result |
+| --- | --- | --- | --- |
+| 1 | [CIMD client](#cimd-clients) | `ALLOWED_CLIENT_IDS`, with an exact or a prefix entry | Only the listed clients and publishers get in |
+| 2 | [DCR client](#dcr-clients) | None | Cannot be limited; setting `ALLOWED_CLIENT_IDS` turns DCR off and refuses every DCR client |
+| 3 | [Upstream `client_id`](#the-upstream-client_id) | `ALLOWED_CLIENT_IDS`, with an exact entry, and `ALLOWED_UPSTREAM_CLIENT_REDIRECT_URIS` | Gets in only when listed, and only with a listed redirect URI |
+
+The three subsections that follow explain each row.
 
 `ClientAllowlist` reads the allowed clients from `ALLOWED_CLIENT_IDS`, and
 `apply` enforces them on any `OAuthProxy` subclass:
@@ -235,9 +243,10 @@ startup log.
 
 #### CIMD clients
 
-This applies to way 1. A CIMD `client_id` is a URL attributable to its
-publisher, so it can be allowed by publisher with a prefix entry, and it is
-the way the allowlist is designed around. A CIMD URL not on the list is never fetched,
+This applies to way 1, which `ALLOWED_CLIENT_IDS` limits, with an exact or a
+prefix entry. A CIMD `client_id` is a URL attributable to its publisher, so it
+can be allowed by publisher with a prefix entry, and it is the way the
+allowlist is designed around. A CIMD URL not on the list is never fetched,
 which also removes the proxy's outbound requests for everything not on the
 list.
 
@@ -255,21 +264,24 @@ out other vendors' hosted clients, not software the user runs locally.
 
 #### DCR clients
 
-This applies to way 2. A `client_id` from DCR is random and anonymous, so
-there is nothing to list, and the allowlist turns DCR off: the `/register`
-route and the `registration_endpoint` in the authorization-server metadata
-disappear, so a client does not attempt a registration that could only fail,
-and nobody can write registrations into the store. Clients registered through
-DCR before the allowlist was set are refused. Clients that support CIMD switch
-to it, since the metadata advertises `client_id_metadata_document_supported`.
-Where clients that support only or also DCR must keep registering through
-DCR, leave `ALLOWED_CLIENT_IDS` unset: the allowlist and DCR cannot be used
-together.
+This applies to way 2, which no setting limits: the allowlist and DCR cannot
+be used together. Setting `ALLOWED_CLIENT_IDS` turns DCR off, so where clients
+must keep registering through DCR, leave `ALLOWED_CLIENT_IDS` unset.
+
+The reason is that a `client_id` from DCR is random and anonymous, so there is
+nothing to list. With the allowlist set, the `/register` route and the
+`registration_endpoint` in the authorization-server metadata disappear, so a
+client does not attempt a registration that could only fail, and nobody can
+write registrations into the store. Clients registered through DCR before the
+allowlist was set are refused. Clients that support CIMD switch to it, since
+the metadata advertises `client_id_metadata_document_supported`.
 
 #### The upstream `client_id`
 
-This applies to way 3 only; `ALLOWED_UPSTREAM_CLIENT_REDIRECT_URIS` has no
-effect on CIMD or DCR clients.
+This applies to way 3, which takes two settings: `ALLOWED_CLIENT_IDS`, with an
+exact entry for the upstream `client_id`, and
+`ALLOWED_UPSTREAM_CLIENT_REDIRECT_URIS`, which has no effect on CIMD or DCR
+clients.
 
 For the upstream `client_id`, FastMCP builds a client on the fly. That client
 has no document and accepts any redirect URI, so on its own the `client_id`
