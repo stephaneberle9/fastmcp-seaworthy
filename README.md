@@ -26,6 +26,7 @@ server that uses it.
 - [Configuration](#configuration)
   - [Environment variables](#environment-variables)
   - [DynamoDB table](#dynamodb-table)
+  - [PostgreSQL table](#postgresql-table)
 - [API Reference](#api-reference)
   - [`serve_http`](#serve_http)
   - [`build_host_router`](#build_host_router)
@@ -61,12 +62,15 @@ pip install fastmcp-seaworthy
 uv add fastmcp-seaworthy
 ```
 
-The DynamoDB store backend needs the `dynamodb` extra:
+The DynamoDB store backend needs the `dynamodb` extra, the PostgreSQL one the
+`postgres` extra:
 
 ```bash
 pip install 'fastmcp-seaworthy[dynamodb]'
+pip install 'fastmcp-seaworthy[postgres]'
 # or, with uv:
 uv add 'fastmcp-seaworthy[dynamodb]'
+uv add 'fastmcp-seaworthy[postgres]'
 ```
 
 Requires Python 3.10+ and FastMCP 4.
@@ -149,9 +153,19 @@ provider = AWSCognitoProvider(
 )
 ```
 
+`STORE_BACKEND` selects where the state lives:
+
+| `STORE_BACKEND` | State lives in | Survives | Extra |
+| --- | --- | --- | --- |
+| `file` (default) | FastMCP's own encrypted file store under `${FASTMCP_HOME}` | restarts on a VM disk or a mounted volume; not a container filesystem | none |
+| `dynamodb` | a DynamoDB table, shared by every replica (see [DynamoDB table](#dynamodb-table)) | any restart | `dynamodb` |
+| `postgres` | a PostgreSQL table, shared by every replica (see [PostgreSQL table](#postgresql-table)) | any restart | `postgres` |
+
 Open the store before serving, so a missing table or missing permissions fail
 the rollout rather than the first sign-in, and close it afterwards —
-`serve_http` does both when given the store.
+`serve_http` does both when given the store. Build it once per process: every
+hostname's provider shares the one store, and with it the one DynamoDB client
+or PostgreSQL connection pool.
 
 ### Limiting which clients connect
 
@@ -343,10 +357,13 @@ Read by `OAuthStateSettings.from_env()`, except `ALLOWED_CLIENT_IDS`, which
 | Variable | Description |
 | --- | --- |
 | `JWT_SIGNING_KEY` | Secret the server signs its tokens with and derives the store's encryption key from. At least 32 characters, e.g. from `secrets.token_urlsafe(32)`; a shorter one is an error. Keep it in a secret store and stable across deployments. Unset, FastMCP derives both from the upstream client secret. Required with any `STORE_BACKEND` other than `file`. |
-| `STORE_BACKEND` | `file` (default) for FastMCP's own encrypted file store, or `dynamodb`. An unknown value is an error, not a fallback to `file`. |
+| `STORE_BACKEND` | `file` (default) for FastMCP's own encrypted file store, `dynamodb` or `postgres`. An unknown value is an error, not a fallback to `file`. |
 | `STORE_DYNAMODB_TABLE` | DynamoDB table name. Required for `STORE_BACKEND=dynamodb`. |
 | `STORE_DYNAMODB_REGION` | AWS region of the table. Optional; unset, the AWS SDK's usual chain decides. |
 | `STORE_DYNAMODB_AUTO_CREATE` | `true` to create a missing table at startup. Default `false`, so a missing table fails the rollout and the server needs no `dynamodb:CreateTable`. |
+| `STORE_POSTGRES_URL` | PostgreSQL connection URL, `postgresql://user:password@db.example.com:5432/appdb`; `postgres://` works too, and libpq query parameters such as `?sslmode=require` are passed on to asyncpg. Required for `STORE_BACKEND=postgres`. Percent-encode `@`, `/`, `?` and `#` in the user name and password (`%40`, `%2F`, `%3F`, `%23`); an unencoded one is an error. Never logged (see [PostgreSQL table](#postgresql-table)). |
+| `STORE_POSTGRES_TABLE` | Table name, optionally schema-qualified as `schema.table` (see [PostgreSQL table](#postgresql-table)). Optional; default `fastmcp_oauth_state`, in the schema the connection's `search_path` resolves it to. Each part: lowercase letters, digits and underscores, not starting with a digit, at most 63 characters; anything else is an error at startup. |
+| `STORE_POSTGRES_AUTO_CREATE` | `true` to create a missing table at startup. Default `false`, so a missing table fails the rollout and the server's role needs no `CREATE` on the schema. |
 | `ALLOWED_CLIENT_IDS` | The OAuth clients the server accepts, separated by commas or whitespace: exact `client_id`s, or `https://` URLs ending in `/` that allow every `client_id` under them (see [Limiting which clients connect](#limiting-which-clients-connect)). Unset, every client is accepted and DCR stays open. Set, DCR is off. |
 | `ALLOWED_UPSTREAM_CLIENT_REDIRECT_URIS` | The redirect URIs a client sending the `client_id` of the upstream application's static client may use, separated by commas or whitespace, in the pattern syntax of FastMCP's `allowed_client_redirect_uris` (e.g. `http://localhost:*`). Required when `ALLOWED_CLIENT_IDS` allows the upstream `client_id`, and applied to that client only (see [The upstream `client_id`](#the-upstream-client_id)). |
 
@@ -393,6 +410,68 @@ The server needs `dynamodb:DescribeTable`, `dynamodb:DescribeTimeToLive`,
 `STORE_DYNAMODB_AUTO_CREATE=true` additionally needs `dynamodb:CreateTable` and
 `dynamodb:UpdateTimeToLive`; so does a table without TTL enabled.
 
+### PostgreSQL table
+
+The store is py-key-value-aio's `PostgreSQLStore`, on one asyncpg connection
+pool per process. Create the table with your migrations, or let
+`STORE_POSTGRES_AUTO_CREATE=true` create it:
+
+```sql
+CREATE TABLE fastmcp_oauth_state (
+    collection TEXT NOT NULL,
+    key TEXT NOT NULL,
+    value JSONB NOT NULL,
+    ttl DOUBLE PRECISION,
+    created_at TIMESTAMPTZ,
+    expires_at TIMESTAMPTZ,
+    PRIMARY KEY (collection, key)
+);
+CREATE INDEX idx_fastmcp_oauth_state_expires_at
+    ON fastmcp_oauth_state (expires_at) WHERE expires_at IS NOT NULL;
+```
+
+The server's role needs `SELECT`, `INSERT`, `UPDATE` and `DELETE` on the
+table; `STORE_POSTGRES_AUTO_CREATE=true` additionally needs `CREATE` on the
+schema.
+
+An unqualified `STORE_POSTGRES_TABLE` resolves through the connection's
+`search_path`, which by default is the role's own schema, then `public`. To
+keep the table in a schema of its own — for example where the database is
+the application's and its migrations own `public` — qualify it:
+`STORE_POSTGRES_TABLE=oauth.fastmcp_oauth_state`. The server then sets the
+pool's `search_path` to that schema alone, so the table, its index and every
+query live there. The schema must exist (`CREATE SCHEMA oauth;`, with
+`USAGE` granted to the server's role); auto-create creates the table, not the
+schema.
+
+At startup the server checks that the table resolves where its queries will
+look for it. `PostgreSQLStore`'s own check finds a table of that name in any
+schema; on its own, a same-named table elsewhere would let the server start
+and fail at the first sign-in. With auto-create off a table missing from the
+resolved schema fails startup, and with auto-create on a table the store
+skipped because of a namesake elsewhere does too.
+
+The connection URL usually carries the database password, so it never
+appears in the startup log line, in `ClientStorage.description`, in the
+settings' `repr()` or in a startup error: they name the table, the database,
+and the host and port only. An error from the database driver that would
+quote the URL or the password is re-raised with both replaced by `***`.
+
+**Expired rows are not deleted.** `PostgreSQLStore` records each entry's
+expiry and ignores expired entries on read, but nothing removes them, so the
+table keeps every expired authorization code and token record. Unlike
+DynamoDB, PostgreSQL has no time to live of its own. Prune it periodically,
+e.g. from a cron job or `pg_cron`; the partial index on `expires_at` keeps
+the statement cheap:
+
+```sql
+DELETE FROM fastmcp_oauth_state WHERE expires_at < now();
+-- or, with a qualified STORE_POSTGRES_TABLE:
+DELETE FROM oauth.fastmcp_oauth_state WHERE expires_at < now();
+```
+
+Entries without an expiry, such as DCR client registrations, are kept.
+
 ## API Reference
 
 ### `serve_http`
@@ -422,16 +501,20 @@ if the server lifespan must outlive the router, as `serve_http` does.
 
 ### `OAuthStateSettings`
 
-`OAuthStateSettings(jwt_signing_key=None, store_backend="file", store_dynamodb_table=None, store_dynamodb_region=None, store_dynamodb_auto_create=False)`
+`OAuthStateSettings(jwt_signing_key=None, store_backend="file", store_dynamodb_table=None, store_dynamodb_region=None, store_dynamodb_auto_create=False, store_postgres_url=None, store_postgres_table=None, store_postgres_auto_create=False)`
 — the signing key and the store an `OAuthProxy` keeps its state in. Frozen
 dataclass; construction raises `ValueError` for a signing key shorter than
-`MIN_JWT_SIGNING_KEY_LENGTH` (32) or a combination the server could not keep
-readable.
+`MIN_JWT_SIGNING_KEY_LENGTH` (32), a combination the server could not keep
+readable, a PostgreSQL URL asyncpg would misread or an invalid PostgreSQL
+table name. The two secrets, `jwt_signing_key` and `store_postgres_url`, are
+left out of `repr()`, and no error message quotes either.
+`store_postgres_table` takes `"table"` or `"schema.table"`; `None` means
+`DEFAULT_POSTGRES_TABLE` (`"fastmcp_oauth_state"`).
 
 | Method | Description |
 | --- | --- |
 | `from_env(environ=None)` | Class method; reads the [environment variables](#environment-variables) from `environ`, default `os.environ` |
-| `describe()` | Returns one line naming the store and signing key in effect, for the startup log; never the key itself |
+| `describe()` | Returns one line naming the store and signing key in effect, for the startup log; never the key itself, and of a PostgreSQL URL only the host, port and database |
 | `provider_kwargs(client_storage)` | Returns the `jwt_signing_key` and `client_storage` keyword arguments for an `OAuthProxy` subclass, each only when set; not for a `RemoteAuthProvider` such as `KeycloakAuthProvider` |
 
 ### `build_client_storage`

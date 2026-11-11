@@ -40,6 +40,27 @@ jobs:
       fail-fast: false
     timeout-minutes: 10
 
+    # PostgreSQL for the store backend's tests. Service containers run on Linux
+    # runners only; an empty image skips the service, so the Windows jobs run
+    # without one and those tests skip there. On Linux TEST_POSTGRES_REQUIRED
+    # turns a skip into a failure, so a broken service cannot hide them.
+    services:
+      postgres:
+        image: ${{ matrix.os == 'ubuntu-latest' && 'postgres:17' || '' }}
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 15
+
+    env:
+      TEST_POSTGRES_URL: postgresql://postgres:postgres@127.0.0.1:5432/postgres
+      TEST_POSTGRES_REQUIRED: ${{ matrix.os == 'ubuntu-latest' && '1' || '' }}
+
     steps:
       - uses: actions/checkout@v5
 

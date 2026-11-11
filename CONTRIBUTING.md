@@ -88,6 +88,20 @@ to `htmlcov/`.
 > The DynamoDB tests run against [moto](https://github.com/getmoto/moto)'s
 > server mode, started in-process on `127.0.0.1`, so the suite needs neither AWS
 > credentials nor Docker.
+>
+> The PostgreSQL tests need a real server and skip when none answers. They
+> connect to `TEST_POSTGRES_URL`, by default
+> `postgresql://postgres:postgres@127.0.0.1:5432/postgres`, which a throwaway
+> container provides:
+>
+> ```bash
+> docker run --rm -d --name fastmcp-seaworthy-pg -e POSTGRES_PASSWORD=postgres -p 127.0.0.1:5432:5432 postgres:17
+> ```
+>
+> Use `127.0.0.1` rather than `localhost` in the URL: `localhost` may resolve
+> to `::1` first, which a port published for IPv4 only does not answer. CI
+> runs a PostgreSQL service container on its Linux jobs and sets
+> `TEST_POSTGRES_REQUIRED=1`, which turns the skip into a failure.
 
 Besides the locked test run, CI runs the suite against the lowest versions the
 declared dependency floors admit (`run-test-lowest.yml`), and installs the built

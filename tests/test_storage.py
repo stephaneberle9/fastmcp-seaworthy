@@ -205,7 +205,7 @@ def test_nothing_configured_imports_no_backend_dependency():
     """Acceptance: a deployment that selects no backend loads no cloud SDK.
 
     Run in a fresh interpreter, because this test session itself has imported
-    them for the DynamoDB tests.
+    them for the DynamoDB and PostgreSQL tests.
     """
     script = textwrap.dedent(
         """
@@ -221,7 +221,9 @@ def test_nothing_configured_imports_no_backend_dependency():
         loaded = sorted(
             name for name in sys.modules
             if name.split(".")[0] in {"aioboto3", "aiobotocore", "boto3", "botocore"}
+            or name.split(".")[0] == "asyncpg"
             or name.startswith("key_value.aio.stores.dynamodb")
+            or name.startswith("key_value.aio.stores.postgresql")
         )
         print(",".join(loaded))
         """

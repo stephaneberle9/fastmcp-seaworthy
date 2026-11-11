@@ -1,9 +1,11 @@
-"""Shared fixtures: a DynamoDB endpoint for the store backend tests."""
+"""Shared fixtures: DynamoDB and PostgreSQL endpoints for the store backend tests."""
 
 from __future__ import annotations
 
+import asyncio
+import os
 import uuid
-from collections.abc import Iterator
+from collections.abc import AsyncIterator, Iterator
 
 import boto3
 import pytest
@@ -76,3 +78,101 @@ def dynamodb_table(aws_env: str) -> str:
         TimeToLiveSpecification={"Enabled": True, "AttributeName": "ttl"},
     )
     return name
+
+
+# --- PostgreSQL -------------------------------------------------------------
+
+DEFAULT_TEST_POSTGRES_URL = "postgresql://postgres:postgres@127.0.0.1:5432/postgres"
+"""Where the PostgreSQL tests look when ``TEST_POSTGRES_URL`` is unset.
+
+The IPv4 loopback literal, not ``localhost``: a server published from a
+container often binds IPv4 only, and a client trying ``::1`` first waits for
+that attempt to time out on every connection.
+"""
+
+
+def _postgres_unavailable(url: str) -> str | None:
+    """Why ``url`` cannot be used, or ``None`` when a server answers there."""
+    try:
+        import asyncpg
+    except ImportError:
+        return "asyncpg is not installed (the 'postgres' extra)"
+
+    async def probe() -> None:
+        connection = await asyncpg.connect(url, timeout=5)
+        await connection.close()
+
+    try:
+        asyncio.run(probe())
+    except (
+        OSError,
+        asyncio.TimeoutError,
+        asyncpg.PostgresError,
+        asyncpg.InterfaceError,
+    ) as e:
+        return f"no PostgreSQL server reachable ({type(e).__name__})"
+    return None
+
+
+@pytest.fixture(scope="session")
+def postgres_url() -> str:
+    """A PostgreSQL server for the store backend tests, or a skip.
+
+    ``TEST_POSTGRES_URL`` points at it, defaulting to a local container on
+    127.0.0.1:5432. Without a server the tests skip, so the suite runs on a
+    machine without Docker; CI sets ``TEST_POSTGRES_REQUIRED=1`` next to its
+    service container, which turns the skip into a failure, so a broken
+    service cannot quietly skip the backend's tests there.
+    """
+    url = os.environ.get("TEST_POSTGRES_URL") or DEFAULT_TEST_POSTGRES_URL
+    reason = _postgres_unavailable(url)
+    if reason is not None:
+        if os.environ.get("TEST_POSTGRES_REQUIRED", "").lower() in ("1", "true"):
+            pytest.fail(f"TEST_POSTGRES_REQUIRED is set, but {reason}")
+        pytest.skip(reason)
+    return url
+
+
+async def postgres_execute(url: str, sql: str, *args: object) -> list:
+    """Run one statement on a connection of its own and return its rows."""
+    import asyncpg
+
+    connection = await asyncpg.connect(url)
+    try:
+        return await connection.fetch(sql, *args)
+    finally:
+        await connection.close()
+
+
+@pytest.fixture
+async def postgres_table(postgres_url: str) -> AsyncIterator[str]:
+    """A table name no other test uses, created by the store, dropped afterwards.
+
+    Only the name: whether the table exists before the store starts is what
+    the auto-create tests are about, so the tests that need it create it
+    themselves with :func:`create_postgres_table`.
+    """
+    name = f"fastmcp_seaworthy_{uuid.uuid4().hex[:12]}"
+    yield name
+    await postgres_execute(postgres_url, f"DROP TABLE IF EXISTS {name}")
+
+
+async def create_postgres_table(url: str, name: str) -> None:
+    """The schema PostgreSQLStore creates with auto-create on, as the README
+    documents it for creating the table ahead of time."""
+    await postgres_execute(
+        url,
+        f"CREATE TABLE {name} ("
+        "collection TEXT NOT NULL, key TEXT NOT NULL, value JSONB NOT NULL, "
+        "ttl DOUBLE PRECISION, created_at TIMESTAMPTZ, expires_at TIMESTAMPTZ, "
+        "PRIMARY KEY (collection, key))",
+    )
+
+
+@pytest.fixture
+async def postgres_schema(postgres_url: str) -> AsyncIterator[str]:
+    """An empty schema of its own, dropped with everything in it afterwards."""
+    name = f"fastmcp_seaworthy_schema_{uuid.uuid4().hex[:12]}"
+    await postgres_execute(postgres_url, f"CREATE SCHEMA {name}")
+    yield name
+    await postgres_execute(postgres_url, f"DROP SCHEMA IF EXISTS {name} CASCADE")

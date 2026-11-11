@@ -18,12 +18,13 @@ everything from the token exchange on runs unmodified.
 from __future__ import annotations
 
 import time
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import fastmcp
+import pytest
 from fastmcp.server.auth.auth import AccessToken
 from fastmcp.server.auth.oauth_proxy.models import ClientCode
 from fastmcp.server.auth.oidc_proxy import OIDCConfiguration, OIDCProxy
@@ -245,14 +246,43 @@ class TestDefaultFileStore:
 SIGNING_KEY = "a-signing-key-shared-by-every-replica"
 
 
-def dynamodb_settings(
-    table: str, jwt_signing_key: str = SIGNING_KEY
-) -> OAuthStateSettings:
-    return OAuthStateSettings(
-        jwt_signing_key=jwt_signing_key,
-        store_backend="dynamodb",
-        store_dynamodb_table=table,
-    )
+SettingsFor = Callable[..., OAuthStateSettings]
+"""Builds the settings of one pod, optionally under another signing key."""
+
+
+@pytest.fixture(params=["dynamodb", "postgres"])
+def store_settings(request: pytest.FixtureRequest) -> SettingsFor:
+    """Settings for each external backend, every pod pointing at the same table.
+
+    PostgreSQL with auto-create on, because the table does not exist before the
+    first pod starts: the restart is what finds it already there. Without a
+    PostgreSQL server the ``postgres`` cases skip.
+    """
+    if request.param == "dynamodb":
+        table = request.getfixturevalue("dynamodb_table")
+
+        def dynamodb(jwt_signing_key: str = SIGNING_KEY) -> OAuthStateSettings:
+            return OAuthStateSettings(
+                jwt_signing_key=jwt_signing_key,
+                store_backend="dynamodb",
+                store_dynamodb_table=table,
+            )
+
+        return dynamodb
+
+    url = request.getfixturevalue("postgres_url")
+    table = request.getfixturevalue("postgres_table")
+
+    def postgres(jwt_signing_key: str = SIGNING_KEY) -> OAuthStateSettings:
+        return OAuthStateSettings(
+            jwt_signing_key=jwt_signing_key,
+            store_backend="postgres",
+            store_postgres_url=url,
+            store_postgres_table=table,
+            store_postgres_auto_create=True,
+        )
+
+    return postgres
 
 
 async def open_storage(settings: OAuthStateSettings) -> ClientStorage:
@@ -263,14 +293,16 @@ async def open_storage(settings: OAuthStateSettings) -> ClientStorage:
     return storage
 
 
-class TestDynamoDBStore:
+class TestExternalStore:
     """An external backend: every pod starts on an empty filesystem, and the
-    state lives in a DynamoDB table the restart does not touch."""
+    state lives in a DynamoDB or PostgreSQL table the restart does not touch.
+    Each pod builds a fresh store instance -- a new connection or pool -- from
+    the same settings."""
 
     async def test_a_dcr_client_and_its_session_survive_a_restart(
-        self, tmp_path: Path, dynamodb_table: str
+        self, tmp_path: Path, store_settings: SettingsFor
     ):
-        config = dynamodb_settings(dynamodb_table)
+        config = store_settings()
         with pod(tmp_path / "pod-1"):
             storage = await open_storage(config)
             before = start_provider(config, client_storage=storage)
@@ -289,13 +321,13 @@ class TestDynamoDBStore:
             await storage.close()
 
     async def test_a_cimd_clients_session_survives_a_restart(
-        self, tmp_path: Path, dynamodb_table: str
+        self, tmp_path: Path, store_settings: SettingsFor
     ):
         """A CIMD client keeps its registration by itself -- the server re-fetches
         its metadata document -- but its session lives in the store like any
         other. The document fetch is not exercised: ``get_client`` for a URL
         client_id goes to the network, and the session does not depend on it."""
-        config = dynamodb_settings(dynamodb_table)
+        config = store_settings()
         with pod(tmp_path / "pod-1"):
             storage = await open_storage(config)
             before = start_provider(config, client_storage=storage)
@@ -309,12 +341,12 @@ class TestDynamoDBStore:
             await storage.close()
 
     async def test_both_survive_a_rotation_of_the_client_secret(
-        self, tmp_path: Path, dynamodb_table: str
+        self, tmp_path: Path, store_settings: SettingsFor
     ):
         """The signing key, not the client secret, signs the tokens and keys
         the store's encryption, so the secret can be rotated freely."""
         with pod(tmp_path / "pod-1"):
-            config = dynamodb_settings(dynamodb_table)
+            config = store_settings()
             storage = await open_storage(config)
             before = start_provider(config, client_storage=storage)
             await before.register_client(client(DCR_CLIENT_ID))
@@ -323,7 +355,7 @@ class TestDynamoDBStore:
             await storage.close()
 
         with pod(tmp_path / "pod-2"):
-            config = dynamodb_settings(dynamodb_table)
+            config = store_settings()
             storage = await open_storage(config)
             after = start_provider(config, ROTATED_SECRET, client_storage=storage)
             assert await after.get_client(DCR_CLIENT_ID) is not None
@@ -332,22 +364,20 @@ class TestDynamoDBStore:
             await storage.close()
 
     async def test_another_signing_key_reads_the_store_as_empty(
-        self, tmp_path: Path, dynamodb_table: str
+        self, tmp_path: Path, store_settings: SettingsFor
     ):
         """The other side of raise_on_decryption_error=False: entries written
         under a different key read as missing, so clients re-register and users
         sign in again instead of every request failing."""
         with pod(tmp_path / "pod-1"):
-            config = dynamodb_settings(dynamodb_table)
+            config = store_settings()
             storage = await open_storage(config)
             before = start_provider(config, client_storage=storage)
             await before.register_client(client(DCR_CLIENT_ID))
             await storage.close()
 
         with pod(tmp_path / "pod-2"):
-            config = dynamodb_settings(
-                dynamodb_table, jwt_signing_key="a-different-signing-key-altogether"
-            )
+            config = store_settings("a-different-signing-key-altogether")
             storage = await open_storage(config)
             after = start_provider(config, client_storage=storage)
             assert await after.get_client(DCR_CLIENT_ID) is None

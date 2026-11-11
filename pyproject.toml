@@ -9,7 +9,7 @@ authors = [
     { name = "Stephan Eberle", email = "stephaneberle9@gmail.com" }
 ]
 requires-python = ">=3.10"
-keywords = ["fastmcp", "mcp", "oauth", "deployment", "dynamodb"]
+keywords = ["fastmcp", "mcp", "oauth", "deployment", "dynamodb", "postgresql"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Framework :: AsyncIO",
@@ -61,6 +61,12 @@ Issues = "https://github.com/stephaneberle9/fastmcp-seaworthy/issues"
 dynamodb = [
     "py-key-value-aio[dynamodb]>=0.4.4",
 ]
+postgres = [
+    "py-key-value-aio[postgresql]>=0.4.4",
+    # Imported directly to set the pool's search_path; the floor is the one
+    # py-key-value-aio's postgresql extra declares, so it narrows nothing.
+    "asyncpg>=0.30.0",
+]
 
 [dependency-groups]
 dev = [
@@ -90,6 +96,11 @@ test = [
     "moto[dynamodb]>=5.1.0",
     "flask>=3.0",
     "flask-cors>=4.0",
+    # The PostgreSQL store backend is tested against a real server: a service
+    # container in CI, and whatever TEST_POSTGRES_URL points at locally, the
+    # tests skipping when nothing answers. The extra is pulled in through the
+    # project for the same reason as the DynamoDB one.
+    "fastmcp-seaworthy[postgres]",
 ]
 
 [build-system]
