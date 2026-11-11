@@ -142,6 +142,34 @@ class TestServeHttp:
 
         assert events == ["open", "close"]
 
+    async def test_banner_is_shown_once_by_default_before_serving(self):
+        """One banner for the server, not one per hostname, as run_http_async
+        shows -- and only once the store is open, so a store that cannot be
+        used fails startup without a banner suggesting the server is up."""
+        events: list[str] = []
+        server = _fake_server()
+        with (
+            patch.object(serve, "create_streamable_http_app"),
+            patch.object(serve, "HostRouter"),
+            patch.object(serve, "uvicorn") as uvicorn_mod,
+            patch(
+                "fastmcp.utilities.cli.log_server_banner",
+                side_effect=lambda server: events.append("banner"),
+            ) as banner,
+        ):
+            uvicorn_mod.Server.return_value.serve = AsyncMock(
+                side_effect=lambda: events.append("serve")
+            )
+            await serve.serve_http(
+                server,
+                [PRIMARY, ALIAS],
+                lambda _: None,
+                client_storage=_storage(events),
+            )
+
+        banner.assert_called_once_with(server=server)
+        assert events == ["open", "banner", "serve", "close"]
+
     async def test_a_store_that_cannot_open_stops_startup_before_serving(self):
         storage = MagicMock(name="storage")
         storage.open = AsyncMock(side_effect=ValueError("Cannot use DynamoDB table"))
