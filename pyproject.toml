@@ -40,9 +40,12 @@ dependencies = [
     # Transitive-but-imported-directly, declared so a future fastmcp that stops
     # depending on them fails at resolution rather than at import. The floors
     # match what the chain already guarantees (fastmcp -> uvicorn>=0.35,
-    # fastmcp -> mcp -> starlette>=0.27, py-key-value-aio's encryption wrapper
-    # -> cryptography>=45), so none of them narrows resolution.
+    # fastmcp -> mcp>=2.0 and pydantic>=2.12, fastmcp -> mcp -> starlette>=0.27,
+    # py-key-value-aio's encryption wrapper -> cryptography>=45), so none of
+    # them narrows resolution.
     "cryptography>=45.0.0",
+    "mcp>=2.0.0",
+    "pydantic>=2.12.0",
     "starlette>=0.27",
     "uvicorn>=0.35",
 ]
@@ -71,10 +74,8 @@ test = [
     "pytest-asyncio>=0.21.0",
     "pytest-cov>=4.0.0",
     "packaging>=22",
-    # Imported by the tests only; all of them arrive with fastmcp anyway.
+    # Imported by the tests only; it arrives with fastmcp anyway.
     "httpx2>=2.5.0",
-    "mcp>=2.0.0",
-    "pydantic>=2.12.0",
     # The DynamoDB store backend is tested against moto's server mode, bound to
     # 127.0.0.1 in-process, so the suite needs neither AWS nor Docker. Server
     # mode rather than moto's in-process patching: the store talks through
